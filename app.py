@@ -132,6 +132,80 @@ def safe_browsing_check(url,key):
         return {"configured":True,"matches":r.json().get("matches",[])}
     except Exception as exc: return {"configured":True,"error":str(exc)}
 
+
+def public_host_check(host):
+    try:
+        ips = sorted({x[4][0] for x in socket.getaddrinfo(host, None)})
+        return bool(ips) and all(ipaddress.ip_address(x).is_global for x in ips), ips
+    except Exception as exc:
+        return False, [str(exc)]
+
+def inspect_public_site(url):
+    current = url
+    redirects = []
+    response = None
+    for _ in range(6):
+        p = urlparse(current)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return {"available": False, "error": "Unsupported redirect URL."}
+        public, ips = public_host_check(p.hostname)
+        if not public:
+            return {"available": False, "error": "Blocked because host did not resolve exclusively to public IPs.", "ips": ips}
+        try:
+            response = requests.get(current, headers={"User-Agent":"PhishGuardAI/1.0 passive scanner", "Accept":"text/html"},
+                                    timeout=(4, 7), allow_redirects=False, verify=True, stream=True)
+        except requests.RequestException as exc:
+            return {"available": False, "error": str(exc)[:200], "redirects": redirects}
+        if response.status_code in (301,302,303,307,308):
+            from urllib.parse import urljoin
+            target = urljoin(current, response.headers.get("Location", ""))
+            status = response.status_code
+            response.close()
+            if not target or target == current:
+                return {"available": False, "error": "Invalid redirect.", "redirects": redirects}
+            redirects.append({"status": status, "to": target})
+            current = target
+            continue
+        break
+    else:
+        return {"available": False, "error": "Too many redirects.", "redirects": redirects}
+    try:
+        headers = dict(response.headers)
+        status = response.status_code
+        final_url = response.url
+        body = b""
+        if "html" in headers.get("Content-Type", "").lower():
+            for chunk in response.iter_content(16384):
+                body += chunk
+                if len(body) >= 150000:
+                    body = body[:150000]
+                    break
+    finally:
+        response.close()
+    html = body.decode("utf-8", errors="ignore")
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    title = re.sub(r"\\s+", " ", re.sub(r"<[^>]+>", "", title_match.group(1))).strip()[:140] if title_match else "Not found"
+    forms = re.findall(r"<form\\b([^>]*)>(.*?)</form\\s*>", html, re.I | re.S)
+    password_forms = 0
+    cross_domain_password_forms = 0
+    from urllib.parse import urljoin
+    for attrs, inner in forms:
+        if re.search(r"type\\s*=\\s*['\\"]?password", inner, re.I):
+            password_forms += 1
+            action = re.search(r"\\baction\\s*=\\s*['\\"]([^'\\"]+)", attrs, re.I)
+            if action:
+                action_host = urlparse(urljoin(final_url, action.group(1))).hostname
+                if action_host and action_host.lower() != (urlparse(final_url).hostname or "").lower():
+                    cross_domain_password_forms += 1
+    lower_headers = {k.lower() for k in headers}
+    security = {"Content-Security-Policy":"content-security-policy", "Strict-Transport-Security":"strict-transport-security",
+                "X-Content-Type-Options":"x-content-type-options", "X-Frame-Options":"x-frame-options"}
+    missing = [name for name, key in security.items() if key not in lower_headers]
+    return {"available":True, "status":status, "final_url":final_url, "redirects":redirects, "title":title,
+            "content_type":headers.get("Content-Type",""), "forms":len(forms), "password_forms":password_forms,
+            "cross_domain_password_forms":cross_domain_password_forms, "missing_headers":missing,
+            "html_bytes_inspected":len(body)}
+
 def run_scan(raw,key):
     url,parsed,host,is_ip=normalize_url(raw)
     score,findings=lexical_checks(url,parsed,host,is_ip)
@@ -151,12 +225,20 @@ def run_scan(raw,key):
         findings.append({"Severity":"High","Finding":"Recently registered domain","Evidence":f"RDAP registration age: {age} days."}); score+=20
     elif age is not None and age<180:
         findings.append({"Severity":"Medium","Finding":"Relatively new domain","Evidence":f"RDAP registration age: {age} days."}); score+=8
+    site=inspect_public_site(url)
+    if site.get("available"):
+        if site.get("cross_domain_password_forms"):
+            findings.append({"Severity":"High","Finding":"Password form posts to another hostname","Evidence":"A password form action points to a different host."}); score+=20
+        if site.get("status",200)>=400:
+            findings.append({"Severity":"Low","Finding":"Website returned an HTTP error","Evidence":f"HTTP status {site['status']}."}); score+=3
+    else:
+        findings.append({"Severity":"Info","Finding":"Live page inspection unavailable","Evidence":site.get("error","Could not fetch page.")})
     intel=safe_browsing_check(url,key)
     confirmed=bool(intel.get("matches"))
     if confirmed: findings.append({"Severity":"Critical","Finding":"Threat-intelligence match","Evidence":"Google Safe Browsing returned a threat match."})
     score=100 if confirmed else min(99,max(0,score))
     level="Potentially malicious" if confirmed else "High risk" if score>=55 else "Suspicious" if score>=25 else "Lower risk"
-    return {"url":url,"host":host,"score":score,"level":level,"findings":findings,"dns":ips,"tls":tls,"rdap":rdap,"intel":intel,"scanned_at":datetime.now(timezone.utc).isoformat()}
+    return {"url":url,"host":host,"score":score,"level":level,"findings":findings,"dns":ips,"tls":tls,"rdap":rdap,"intel":intel,"site":site,"scanned_at":datetime.now(timezone.utc).isoformat()}
 
 with st.sidebar:
     st.header("⚙️ Scanner settings")
@@ -208,6 +290,25 @@ if "latest" in st.session_state:
         if r["intel"].get("matches"): st.error("Known threat match found.")
         elif r["intel"].get("configured"): st.write("No match returned." if not r["intel"].get("error") else r["intel"]["error"])
         else: st.write("Not configured. Add an API key in the sidebar to enable this check.")
+
+    st.markdown("### Live website inspection")
+    site=r.get("site", {})
+    if site.get("available"):
+        a,b,c=st.columns(3)
+        a.metric("HTTP status", site.get("status", "—"))
+        b.metric("Forms found", site.get("forms", 0))
+        c.metric("Password forms", site.get("password_forms", 0))
+        st.write("Page title:", site.get("title", "Not found"))
+        st.write("Final URL:", site.get("final_url", r["url"]))
+        st.write("Missing security headers:", ", ".join(site.get("missing_headers", [])) or "None of the checked headers are missing")
+        if site.get("cross_domain_password_forms"):
+            st.warning("A password form submits to another hostname. Verify this manually.")
+        if site.get("redirects"):
+            st.write("Redirect chain:", site["redirects"])
+    else:
+        st.info("Live page inspection unavailable: " + site.get("error", "Unknown error"))
+    st.caption("Passive inspection only: no form submissions, logins, exploitation, or crawling.")
+
     st.markdown("### Findings & evidence")
     if r["findings"]: st.dataframe(pd.DataFrame(r["findings"]),use_container_width=True,hide_index=True)
     else: st.info("No heuristic warning signals were detected.")
