@@ -127,7 +127,7 @@ def safe_browsing_check(url,key):
     if not key: return {"configured":False,"status":"Not configured"}
     endpoint="https://safebrowsing.googleapis.com/v5/urls:search"
     try:
-        r=requests.get(endpoint,params=[("key",key),("urls",url)],
+        r=requests.get(endpoint,params=[("key",key),("urls",url),("alt","json")],
                        headers={"Accept":"application/json"},timeout=15)
         body=r.text.strip()
         if r.status_code != 200:
@@ -286,6 +286,8 @@ def run_scan(raw,key):
         findings.append({"Severity":"Info","Finding":"Live page inspection unavailable","Evidence":site.get("error","Could not fetch page.")})
     intel=safe_browsing_check(url,key)
     confirmed=bool(intel.get("matches"))
+    if intel.get("error"):
+        findings.append({"Severity":"Info","Finding":"Threat-intelligence lookup could not be interpreted","Evidence":"Google Safe Browsing did not provide a usable result; the risk score excludes this unavailable check."})
     if confirmed:
         kinds=sorted({kind for match in intel.get("matches",[]) for kind in match.get("threatTypes",[])})
         findings.append({"Severity":"Critical","Finding":"Google Safe Browsing threat match","Evidence":"Threat type(s): " + (", ".join(kinds) if kinds else "Known unsafe URL")})
@@ -329,6 +331,7 @@ if "latest" in st.session_state:
     c3.metric("DNS addresses",len(r["dns"]))
     if r["score"]>=55: st.error(f"⚠️ {r['level']}: avoid interacting until independently verified.")
     elif r["score"]>=25: st.warning(f"⚠️ {r['level']}: review the evidence before proceeding.")
+    elif r.get("intel", {}).get("error"): st.warning("Threat intelligence could not be verified. The displayed score excludes this check; do not treat it as a clean result.")
     else: st.success("No strong warning signals were identified. This does not prove the site is safe.")
     left,right=st.columns(2)
     with left:
