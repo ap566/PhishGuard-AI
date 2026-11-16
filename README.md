@@ -7,7 +7,8 @@ A Streamlit dashboard for defensive phishing and suspicious-URL screening.
 - Heuristic checks for suspicious URL structure, keywords, punycode, IP hosts and lookalike-style hostnames
 - DNS resolution and HTTPS/TLS certificate verification
 - RDAP domain registration lookup (when registry data is available)
-- Optional Google Safe Browsing lookup
+- Google Safe Browsing v5 URL threat lookup (API key required)
+- Optional Google Fact Check Tools claim search using the public page title and description (same Google API key; Fact Check Tools API must also be enabled)
 - Risk score with evidence table, session-only scan history and JSON report export
 - Responsive dark cybersecurity-themed interface
 
@@ -25,10 +26,13 @@ streamlit run app.py
 3. Create an app, select this repository, branch `main`, and file `app.py`.
 4. Deploy.
 
-Optional Google Safe Browsing API key can be entered in the app sidebar. The current integration uses the Safe Browsing v4 endpoint; verify Google's current product and API terms before relying on it. Google's Safe Browsing API is intended for non-commercial use; commercial use should use the appropriate Web Risk product.
+Enter a Google API key in the sidebar to enable Google Safe Browsing v5 and Google Fact Check Tools claim search. In Google Cloud, enable **Safe Browsing API** and **Fact Check Tools API**, and ensure both are allowed by the key's API restrictions. Safe Browsing v5 checks the submitted URL against Google's known threat data. Fact Check Tools searches the page title and meta description against indexed ClaimReview records; it does not rate an entire publisher or prove an article true or false. See the [Safe Browsing v5 documentation](https://developers.google.com/safe-browsing/reference/rest/v5/urls/search) and [Fact Check Tools API documentation](https://developers.google.com/fact-check/tools/api/reference/rest/v1alpha1/claims/search). Google's Safe Browsing API is for non-commercial use; commercial services should evaluate Google Web Risk.
 
 ## Important limitations
-- A low risk score is **not** proof that a website is safe.
+- A low technical risk score is **not** proof that a website is safe, legitimate, authentic, or truthful.
+- No tool can reliably classify every website as real or fake. Newly created threats and unindexed misinformation may not appear in available sources.
+- A missing Safe Browsing match means only that Google returned no known match for that submitted URL at scan time.
+- Fact-check results apply to specific claims and their cited reviews, not to an entire domain or publisher.
 - Heuristic checks can produce false positives and false negatives.
 - RDAP data may be missing or incomplete.
 - This version does not crawl page content, inspect authenticated pages, submit forms, bypass logins, exploit websites, or guarantee security.
