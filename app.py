@@ -272,11 +272,24 @@ def inspect_public_site(url):
         public, ips = public_host_check(p.hostname)
         if not public:
             return {"available": False, "error": "Blocked because host did not resolve exclusively to public IPs.", "ips": ips}
-        try:
-            response = requests.get(current, headers={"User-Agent":"PhishGuardAI/1.0 passive scanner", "Accept":"text/html"},
-                                    timeout=(4, 7), allow_redirects=False, verify=True, stream=True)
-        except requests.RequestException as exc:
-            return {"available": False, "error": str(exc)[:200], "redirects": redirects}
+        response = None
+        last_error = None
+        # Retry once with a longer read timeout for slow but reachable websites.
+        for attempt, timeout in enumerate(((4, 8), (5, 15))):
+            try:
+                response = requests.get(current, headers={"User-Agent":"PhishGuardAI/1.0 passive scanner", "Accept":"text/html"},
+                                         timeout=timeout, allow_redirects=False, verify=True, stream=True)
+                if response.status_code not in (429, 500, 502, 503, 504) or attempt == 1:
+                    break
+                response.close()
+                response = None
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt == 1:
+                    return {"available": False, "error": str(exc)[:200], "redirects": redirects, "retry_attempts": 1}
+        if response is None:
+            return {"available": False, "error": str(last_error or "Website did not respond after retry.")[:200],
+                    "redirects": redirects, "retry_attempts": 1}
         if response.status_code in (301,302,303,307,308):
             from urllib.parse import urljoin
             target = urljoin(current, response.headers.get("Location", ""))
@@ -330,7 +343,7 @@ def inspect_public_site(url):
                 "X-Content-Type-Options":"x-content-type-options", "X-Frame-Options":"x-frame-options"}
     missing = [name for name, key in security.items() if key not in lower_headers]
     return {"available":True, "status":status, "final_url":final_url, "redirects":redirects, "title":title,
-            "description":description, "page_text":visible_text,
+            "description":description, "page_text":visible_text, "retry_attempts": 1 if 'attempt' in locals() and attempt > 0 else 0,
             "content_type":headers.get("Content-Type",""), "forms":len(forms), "password_forms":password_forms,
             "cross_domain_password_forms":cross_domain_password_forms, "missing_headers":missing,
             "html_bytes_inspected":len(body)}
@@ -369,7 +382,9 @@ def run_scan(raw,key):
     if confirmed:
         kinds=sorted({kind for match in intel.get("matches",[]) for kind in match.get("threatTypes",[])})
         findings.append({"Severity":"Critical","Finding":"Google Safe Browsing threat match","Evidence":"Threat type(s): " + (", ".join(kinds) if kinds else "Known unsafe URL")})
-    page_query=" ".join([site.get("title",""),site.get("description","")]).strip() if site.get("available") else ""
+    # Search indexed ClaimReview records using the page title, description and a short
+    # excerpt from visible text; this is article-level matching, not a publisher rating.
+    page_query=" ".join([site.get("title",""),site.get("description",""),site.get("page_text","")[:240]]).strip() if site.get("available") else ""
     factchecks=factcheck_search(page_query,key) if page_query else {"configured":bool(key),"status":"Page text unavailable","claims":[]}
     if factchecks.get("claims"):
         findings.append({"Severity":"Info","Finding":"Fact-check references found","Evidence":f"{len(factchecks['claims'])} related claim(s) found in Google's fact-check index. Review each publisher's rating and context."})
@@ -409,8 +424,9 @@ if "latest" in st.session_state:
     c3.metric("DNS addresses",len(r["dns"]))
     if r["score"]>=55: st.error(f"⚠️ {r['level']}: avoid interacting until independently verified.")
     elif r["score"]>=25: st.warning(f"⚠️ {r['level']}: review the evidence before proceeding.")
-    elif r.get("intel", {}).get("error"): st.warning("Threat intelligence could not be verified. The displayed score excludes this check; do not treat it as a clean result.")
-    else: st.success("No strong warning signals were identified. This does not prove the site is safe.")
+    elif r.get("intel", {}).get("error") or not r.get("site", {}).get("available"):
+        st.warning("Assessment incomplete: one or more checks could not be completed. The score excludes unavailable checks; do not treat it as a clean result.")
+    else: st.success("No strong technical warning signals were identified by the checks that completed. This does not prove the site is safe.")
     left,right=st.columns(2)
     with left:
         st.markdown("**🌐 URL & domain intelligence**")
@@ -438,10 +454,11 @@ if "latest" in st.session_state:
     st.markdown("### Live website inspection")
     site=r.get("site", {})
     if site.get("available"):
-        a,b,c=st.columns(3)
+        a,b,c,d=st.columns(4)
         a.metric("HTTP status", site.get("status", "—"))
-        b.metric("Forms found", site.get("forms", 0))
-        c.metric("Password forms", site.get("password_forms", 0))
+        b.metric("Retry attempts", site.get("retry_attempts", 0))
+        c.metric("Forms found", site.get("forms", 0))
+        d.metric("Password forms", site.get("password_forms", 0))
         st.write("Page title:", site.get("title", "Not found"))
         st.write("Final URL:", site.get("final_url", r["url"]))
         st.write("Missing security headers:", ", ".join(site.get("missing_headers", [])) or "None of the checked headers are missing")
@@ -450,10 +467,12 @@ if "latest" in st.session_state:
         if site.get("redirects"):
             st.write("Redirect chain:", site["redirects"])
     else:
-        st.info("Live page inspection unavailable: " + site.get("error", "Unknown error"))
+        st.warning("Live page inspection unavailable after retry: " + site.get("error", "Unknown error"))
+        st.caption("DNS, TLS, RDAP and threat-intelligence checks may still have completed, but page content and forms were not assessed.")
     st.caption("Passive inspection only: no form submissions, logins, exploitation, or crawling.")
 
     st.markdown("### Publisher and article fact-check references")
+    st.info("Publisher reputation is not currently rated by this scanner. Domain age, HTTPS and Safe Browsing results are technical signals only; they do not establish editorial credibility.")
     fc=r.get("factchecks",{})
     if fc.get("claims"):
         for item in fc["claims"]:
@@ -463,9 +482,11 @@ if "latest" in st.session_state:
                 st.write(f"**Rating:** {review.get('rating') or 'Not supplied'} · **Publisher:** {review.get('publisher') or 'Unknown'}")
                 if review.get("title") and review.get("url"): st.markdown(f"[{review['title']}]({review['url']})")
     elif fc.get("error"):
-        st.info("Fact-check lookup did not complete: " + fc["error"])
+        st.info("Article fact-check lookup did not complete: " + fc["error"])
+    elif not site.get("available"):
+        st.caption("Article fact-check was not run because page text could not be retrieved. This is an unavailable check, not a clean result.")
     else:
-        st.caption("No matching ClaimReview record was returned for the page title/description. This does not mean the article is true.")
+        st.caption("No matching ClaimReview record was returned for the available page title, description and short text excerpt. This does not mean the article is true.")
     st.caption("Fact-check results concern matching claims, not a blanket rating of the whole domain.")
 
     st.markdown("### Findings & evidence")
