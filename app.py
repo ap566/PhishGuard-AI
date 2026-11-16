@@ -127,16 +127,27 @@ def safe_browsing_check(url,key):
     if not key: return {"configured":False,"status":"Not configured"}
     endpoint="https://safebrowsing.googleapis.com/v5/urls:search"
     try:
-        r=requests.get(endpoint,params=[("key",key),("urls",url)],timeout=10)
+        r=requests.get(endpoint,params=[("key",key),("urls",url)],
+                       headers={"Accept":"application/json"},timeout=15)
+        body=r.text.strip()
         if r.status_code != 200:
             detail=""
             try: detail=r.json().get("error",{}).get("message","")
-            except Exception: pass
+            except Exception: detail=body[:240]
             return {"configured":True,"error":f"Google Safe Browsing HTTP {r.status_code}. {detail}".strip(),"matches":[]}
-        data=r.json()
+        try:
+            data=r.json()
+        except ValueError:
+            # Preserve the response diagnostics instead of silently treating a parse failure as a clean result.
+            return {"configured":True,"error":f"Google Safe Browsing returned an unreadable response (HTTP {r.status_code}, content-type: {r.headers.get('Content-Type','unknown')}). Response preview: {body[:240]!r}","matches":[]}
+        if not isinstance(data,dict):
+            return {"configured":True,"error":"Google Safe Browsing returned an unexpected response structure.","matches":[]}
         matches=data.get("threats",[])
         return {"configured":True,"matches":matches,"status":"Threat match" if matches else "No known threat match","cache_duration":data.get("cacheDuration")}
-    except Exception as exc: return {"configured":True,"error":str(exc),"matches":[]}
+    except requests.RequestException as exc:
+        return {"configured":True,"error":f"Google Safe Browsing request failed: {exc}","matches":[]}
+    except Exception as exc:
+        return {"configured":True,"error":f"Google Safe Browsing check failed: {exc}","matches":[]}
 
 def factcheck_search(query,key):
     """Search Google's ClaimReview index for text extracted from the public page."""
@@ -150,7 +161,8 @@ def factcheck_search(query,key):
             detail=""
             try: detail=r.json().get("error",{}).get("message","")
             except Exception: pass
-            return {"configured":True,"error":f"Fact Check API HTTP {r.status_code}. {detail}".strip(),"claims":[]}
+            hint=" Enable Fact Check Tools API in the same Google Cloud project and verify this key is allowed to call it." if r.status_code==403 else ""
+            return {"configured":True,"error":f"Fact Check API HTTP {r.status_code}. {detail}{hint}".strip(),"claims":[]}
         claims=[]
         for item in r.json().get("claims",[]):
             reviews=item.get("claimReview",[])
