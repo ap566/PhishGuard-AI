@@ -184,15 +184,15 @@ def inspect_public_site(url):
         response.close()
     html = body.decode("utf-8", errors="ignore")
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
-    title = re.sub(r"\\s+", " ", re.sub(r"<[^>]+>", "", title_match.group(1))).strip()[:140] if title_match else "Not found"
-    forms = re.findall(r"<form\\b([^>]*)>(.*?)</form\\s*>", html, re.I | re.S)
+    title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", title_match.group(1))).strip()[:140] if title_match else "Not found"
+    forms = re.findall(r"<form\b([^>]*)>(.*?)</form\s*>", html, re.I | re.S)
     password_forms = 0
     cross_domain_password_forms = 0
     from urllib.parse import urljoin
     for attrs, inner in forms:
-        if re.search(r"type\\s*=\\s*['\\"]?password", inner, re.I):
+        if re.search(r"""type\s*=\s*['"]?password""", inner, re.I):
             password_forms += 1
-            action = re.search(r"\\baction\\s*=\\s*['\\"]([^'\\"]+)", attrs, re.I)
+            action = re.search(r"""\baction\s*=\s*['"]([^'"]+)""", attrs, re.I)
             if action:
                 action_host = urlparse(urljoin(final_url, action.group(1))).hostname
                 if action_host and action_host.lower() != (urlparse(final_url).hostname or "").lower():
