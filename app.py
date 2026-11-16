@@ -123,14 +123,45 @@ def rdap_check(host):
     except Exception as exc: return {"available":False,"error":str(exc)}
 
 def safe_browsing_check(url,key):
-    if not key: return {"configured":False}
-    endpoint="https://safebrowsing.googleapis.com/v4/threatMatches:find"
-    body={"client":{"clientId":"phishguard-ai","clientVersion":"1.0"},"threatInfo":{"threatTypes":["MALWARE","SOCIAL_ENGINEERING","UNWANTED_SOFTWARE"],"platformTypes":["ANY_PLATFORM"],"threatEntryTypes":["URL"],"threatEntries":[{"url":url}]}}
+    """Google Safe Browsing v5 URL lookup. Empty threats means no known match, not safe."""
+    if not key: return {"configured":False,"status":"Not configured"}
+    endpoint="https://safebrowsing.googleapis.com/v5/urls:search"
     try:
-        r=requests.post(endpoint,params={"key":key},json=body,timeout=8)
-        if r.status_code != 200: return {"configured":True,"error":f"API returned HTTP {r.status_code}"}
-        return {"configured":True,"matches":r.json().get("matches",[])}
-    except Exception as exc: return {"configured":True,"error":str(exc)}
+        r=requests.get(endpoint,params=[("key",key),("urls",url)],timeout=10)
+        if r.status_code != 200:
+            detail=""
+            try: detail=r.json().get("error",{}).get("message","")
+            except Exception: pass
+            return {"configured":True,"error":f"Google Safe Browsing HTTP {r.status_code}. {detail}".strip(),"matches":[]}
+        data=r.json()
+        matches=data.get("threats",[])
+        return {"configured":True,"matches":matches,"status":"Threat match" if matches else "No known threat match","cache_duration":data.get("cacheDuration")}
+    except Exception as exc: return {"configured":True,"error":str(exc),"matches":[]}
+
+def factcheck_search(query,key):
+    """Search Google's ClaimReview index for text extracted from the public page."""
+    if not key or not query:
+        return {"configured":bool(key),"status":"Not run","claims":[]}
+    try:
+        r=requests.get("https://factchecktools.googleapis.com/v1alpha1/claims:search",
+                       params={"key":key,"query":query[:400],"pageSize":5,"languageCode":"en"},
+                       timeout=10)
+        if r.status_code != 200:
+            detail=""
+            try: detail=r.json().get("error",{}).get("message","")
+            except Exception: pass
+            return {"configured":True,"error":f"Fact Check API HTTP {r.status_code}. {detail}".strip(),"claims":[]}
+        claims=[]
+        for item in r.json().get("claims",[]):
+            reviews=item.get("claimReview",[])
+            claims.append({"claim":item.get("text",""),"claim_date":item.get("claimDate",""),
+                           "claimant":item.get("claimant",""),
+                           "reviews":[{"publisher":x.get("publisher",{}).get("name","Unknown"),
+                                       "url":x.get("url",""),"title":x.get("title",""),
+                                       "rating":x.get("textualRating","")} for x in reviews[:3]]})
+        return {"configured":True,"status":"Results found" if claims else "No matching fact-check indexed","claims":claims}
+    except Exception as exc:
+        return {"configured":True,"error":str(exc),"claims":[]}
 
 
 def public_host_check(host):
@@ -185,6 +216,13 @@ def inspect_public_site(url):
     html = body.decode("utf-8", errors="ignore")
     title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
     title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", title_match.group(1))).strip()[:140] if title_match else "Not found"
+    desc_match = re.search(r"""<meta[^>]+name=['"]description['"][^>]+content=['"]([^'"]*)""", html, re.I)
+    if not desc_match:
+        desc_match = re.search(r"""<meta[^>]+content=['"]([^'"]*)['"][^>]+name=['"]description['"]""", html, re.I)
+    description = re.sub(r"\s+", " ", desc_match.group(1)).strip()[:500] if desc_match else ""
+    visible_text = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", html, flags=re.I|re.S)
+    visible_text = re.sub(r"<[^>]+>", " ", visible_text)
+    visible_text = re.sub(r"\s+", " ", visible_text).strip()[:3000]
     forms = re.findall(r"<form\b([^>]*)>(.*?)</form\s*>", html, re.I | re.S)
     password_forms = 0
     cross_domain_password_forms = 0
@@ -202,6 +240,7 @@ def inspect_public_site(url):
                 "X-Content-Type-Options":"x-content-type-options", "X-Frame-Options":"x-frame-options"}
     missing = [name for name, key in security.items() if key not in lower_headers]
     return {"available":True, "status":status, "final_url":final_url, "redirects":redirects, "title":title,
+            "description":description, "page_text":visible_text,
             "content_type":headers.get("Content-Type",""), "forms":len(forms), "password_forms":password_forms,
             "cross_domain_password_forms":cross_domain_password_forms, "missing_headers":missing,
             "html_bytes_inspected":len(body)}
@@ -235,15 +274,21 @@ def run_scan(raw,key):
         findings.append({"Severity":"Info","Finding":"Live page inspection unavailable","Evidence":site.get("error","Could not fetch page.")})
     intel=safe_browsing_check(url,key)
     confirmed=bool(intel.get("matches"))
-    if confirmed: findings.append({"Severity":"Critical","Finding":"Threat-intelligence match","Evidence":"Google Safe Browsing returned a threat match."})
+    if confirmed:
+        kinds=sorted({kind for match in intel.get("matches",[]) for kind in match.get("threatTypes",[])})
+        findings.append({"Severity":"Critical","Finding":"Google Safe Browsing threat match","Evidence":"Threat type(s): " + (", ".join(kinds) if kinds else "Known unsafe URL")})
+    page_query=" ".join([site.get("title",""),site.get("description","")]).strip() if site.get("available") else ""
+    factchecks=factcheck_search(page_query,key) if page_query else {"configured":bool(key),"status":"Page text unavailable","claims":[]}
+    if factchecks.get("claims"):
+        findings.append({"Severity":"Info","Finding":"Fact-check references found","Evidence":f"{len(factchecks['claims'])} related claim(s) found in Google's fact-check index. Review each publisher's rating and context."})
     score=100 if confirmed else min(99,max(0,score))
-    level="Potentially malicious" if confirmed else "High risk" if score>=55 else "Suspicious" if score>=25 else "Lower risk"
-    return {"url":url,"host":host,"score":score,"level":level,"findings":findings,"dns":ips,"tls":tls,"rdap":rdap,"intel":intel,"site":site,"scanned_at":datetime.now(timezone.utc).isoformat()}
+    level="Known malicious/phishing indicator" if confirmed else "High technical risk" if score>=55 else "Suspicious technical signals" if score>=25 else "No strong technical warning signals"
+    return {"url":url,"host":host,"score":score,"level":level,"findings":findings,"dns":ips,"tls":tls,"rdap":rdap,"intel":intel,"factchecks":factchecks,"site":site,"scanned_at":datetime.now(timezone.utc).isoformat()}
 
 with st.sidebar:
     st.header("⚙️ Scanner settings")
     api_key=st.text_input("Google Safe Browsing API key (optional)",type="password",help="Leave blank to use local checks.")
-    st.caption("The key is used for the current scan and is not added to scan history.")
+    st.caption("Keep this key private. Enable Google Safe Browsing API and Fact Check Tools API in Cloud Console to use both services.")
     st.divider()
     st.markdown("**Detection layers**")
     st.write("• URL structure\n• DNS resolution\n• TLS certificate\n• RDAP registration\n• Optional threat intelligence")
@@ -288,8 +333,14 @@ if "latest" in st.session_state:
         st.write("Estimated age:",f"{age} days" if age is not None else "Unavailable")
         st.markdown("**🛰️ Threat intelligence**")
         if r["intel"].get("matches"): st.error("Known threat match found.")
-        elif r["intel"].get("configured"): st.write("No match returned." if not r["intel"].get("error") else r["intel"]["error"])
-        else: st.write("Not configured. Add an API key in the sidebar to enable this check.")
+        elif r["intel"].get("error"): st.warning(r["intel"]["error"])
+        elif r["intel"].get("configured"): st.write("No known threat match returned by Google Safe Browsing v5.")
+        else: st.write("Not configured. Add an API key in the sidebar.")
+        st.markdown("**📰 Fact-check claim search**")
+        fc=r.get("factchecks",{})
+        if fc.get("claims"): st.write(f"{len(fc['claims'])} related fact-check record(s) found.")
+        elif fc.get("error"): st.warning(fc["error"])
+        else: st.write(fc.get("status","Not run"))
 
     st.markdown("### Live website inspection")
     site=r.get("site", {})
@@ -308,6 +359,21 @@ if "latest" in st.session_state:
     else:
         st.info("Live page inspection unavailable: " + site.get("error", "Unknown error"))
     st.caption("Passive inspection only: no form submissions, logins, exploitation, or crawling.")
+
+    st.markdown("### Publisher and article fact-check references")
+    fc=r.get("factchecks",{})
+    if fc.get("claims"):
+        for item in fc["claims"]:
+            st.markdown(f"**Claim:** {item.get('claim') or 'Claim text unavailable'}")
+            if item.get("claimant"): st.caption("Claimant: " + item["claimant"])
+            for review in item.get("reviews",[]):
+                st.write(f"**Rating:** {review.get('rating') or 'Not supplied'} · **Publisher:** {review.get('publisher') or 'Unknown'}")
+                if review.get("title") and review.get("url"): st.markdown(f"[{review['title']}]({review['url']})")
+    elif fc.get("error"):
+        st.info("Fact-check lookup did not complete: " + fc["error"])
+    else:
+        st.caption("No matching ClaimReview record was returned for the page title/description. This does not mean the article is true.")
+    st.caption("Fact-check results concern matching claims, not a blanket rating of the whole domain.")
 
     st.markdown("### Findings & evidence")
     if r["findings"]: st.dataframe(pd.DataFrame(r["findings"]),use_container_width=True,hide_index=True)
