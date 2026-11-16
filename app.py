@@ -122,24 +122,102 @@ def rdap_check(host):
         return {"available":True,"created":created,"age_days":age}
     except Exception as exc: return {"available":False,"error":str(exc)}
 
+def _protobuf_read_varint(data, pos):
+    value = 0
+    shift = 0
+    while pos < len(data):
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7f) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+        if shift >= 70:
+            raise ValueError("Invalid protobuf varint")
+    raise ValueError("Truncated protobuf varint")
+
+
+def _protobuf_fields(data):
+    fields = []
+    pos = 0
+    while pos < len(data):
+        tag, pos = _protobuf_read_varint(data, pos)
+        number, wire = tag >> 3, tag & 7
+        if number == 0:
+            raise ValueError("Invalid protobuf field number")
+        if wire == 0:
+            value, pos = _protobuf_read_varint(data, pos)
+        elif wire == 1:
+            value = data[pos:pos + 8]
+            pos += 8
+        elif wire == 2:
+            size, pos = _protobuf_read_varint(data, pos)
+            value = data[pos:pos + size]
+            pos += size
+            if len(value) != size:
+                raise ValueError("Truncated protobuf field")
+        elif wire == 5:
+            value = data[pos:pos + 4]
+            pos += 4
+        else:
+            raise ValueError("Unsupported protobuf wire type")
+        if pos > len(data):
+            raise ValueError("Truncated protobuf message")
+        fields.append((number, wire, value))
+    return fields
+
+
+def _decode_safe_browsing_v5(data):
+    threat_names = {
+        1: "MALWARE",
+        2: "SOCIAL_ENGINEERING",
+        3: "UNWANTED_SOFTWARE",
+        4: "POTENTIALLY_HARMFUL_APPLICATION",
+    }
+    result = {"threats": [], "cacheDuration": None}
+    for number, wire, value in _protobuf_fields(data):
+        if number == 1 and wire == 2:
+            match = {"url": "", "threatTypes": []}
+            for child_number, child_wire, child_value in _protobuf_fields(value):
+                if child_number == 1 and child_wire == 2:
+                    match["url"] = child_value.decode("utf-8", errors="replace")
+                elif child_number == 2:
+                    if child_wire == 0:
+                        match["threatTypes"].append(threat_names.get(child_value, "UNKNOWN"))
+                    elif child_wire == 2:
+                        offset = 0
+                        while offset < len(child_value):
+                            enum_value, offset = _protobuf_read_varint(child_value, offset)
+                            match["threatTypes"].append(threat_names.get(enum_value, "UNKNOWN"))
+            if match["url"]:
+                result["threats"].append(match)
+        elif number == 2 and wire == 2:
+            result["cacheDuration"] = value.decode("utf-8", errors="replace")
+    return result
+
+
 def safe_browsing_check(url,key):
-    """Google Safe Browsing v5 URL lookup. Empty threats means no known match, not safe."""
+    """Google Safe Browsing v5 URL lookup; decode Google's protobuf response."""
     if not key: return {"configured":False,"status":"Not configured"}
     endpoint="https://safebrowsing.googleapis.com/v5/urls:search"
     try:
-        r=requests.get(endpoint,params=[("key",key),("urls",url),("alt","json")],
-                       headers={"Accept":"application/json"},timeout=15)
-        body=r.text.strip()
+        # Safe Browsing v5 returns Protocol Buffers; do not request alt=json.
+        r=requests.get(endpoint,params=[("key",key),("urls",url)],
+                       timeout=15)
+        body=r.content
         if r.status_code != 200:
             detail=""
             try: detail=r.json().get("error",{}).get("message","")
-            except Exception: detail=body[:240]
+            except Exception: detail=body[:240].decode("utf-8",errors="replace")
             return {"configured":True,"error":f"Google Safe Browsing HTTP {r.status_code}. {detail}".strip(),"matches":[]}
+        content_type=r.headers.get("Content-Type","").lower()
         try:
-            data=r.json()
-        except ValueError:
-            # Preserve the response diagnostics instead of silently treating a parse failure as a clean result.
-            return {"configured":True,"error":f"Google Safe Browsing returned an unreadable response (HTTP {r.status_code}, content-type: {r.headers.get('Content-Type','unknown')}). Response preview: {body[:240]!r}","matches":[]}
+            if "json" in content_type or body.lstrip().startswith(b"{"):
+                data=r.json()
+            else:
+                data=_decode_safe_browsing_v5(body)
+        except Exception as exc:
+            return {"configured":True,"error":f"Google Safe Browsing response could not be decoded ({content_type or 'unknown content type'}): {exc}","matches":[]}
         if not isinstance(data,dict):
             return {"configured":True,"error":"Google Safe Browsing returned an unexpected response structure.","matches":[]}
         matches=data.get("threats",[])
