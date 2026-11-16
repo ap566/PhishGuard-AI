@@ -138,9 +138,13 @@ def run_scan(raw,key):
     ips,dns_error=dns_check(host)
     if dns_error:
         findings.append({"Severity":"Medium","Finding":"DNS lookup failed","Evidence":dns_error[:180]}); score+=8
-    tls=tls_check(host) if parsed.scheme=="https" else {"valid":False}
+    if parsed.scheme=="https":
+        tls,tls_error=tls_check(host)
+    else:
+        tls,tls_error={"valid":False},None
     if parsed.scheme=="https" and not tls.get("valid"):
-        findings.append({"Severity":"High","Finding":"TLS certificate check failed","Evidence":"Could not validate a certificate on port 443."}); score+=15
+        evidence=("TLS check failed: " + tls_error[:150]) if tls_error else "Could not validate a certificate on port 443."
+        findings.append({"Severity":"High","Finding":"TLS certificate check failed","Evidence":evidence}); score+=15
     rdap=rdap_check(host) if not is_ip else {"available":False}
     age=rdap.get("age_days")
     if age is not None and age<30:
